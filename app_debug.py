@@ -1,29 +1,18 @@
 import gradio as gr
 import torch
 import torchaudio
-from pprint import pformat, pprint
 import numpy as np
 from transformers import ClapModel, ClapProcessor
+from pprint import pprint
 
 # --- Initialize Models and Processors ---
 torch.set_num_threads(1)
-
-# Silero VAD
-try:
-    vad_model, vad_utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
-except Exception:
-    vad_model, vad_utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=True)
-
-(get_speech_timestamps, _, read_audio, VADIterator, *_) = vad_utils
-VAD_SAMPLING_RATE = 16000
-CHUNK_SIZE = 512
-MIN_SEGMENT_SAMPLES = VAD_SAMPLING_RATE * 2  # 2 seconds
 
 # CLAP
 print("Loading the CLAP model and processor...")
 clap_model = ClapModel.from_pretrained("laion/clap-htsat-unfused")
 clap_processor = ClapProcessor.from_pretrained("laion/clap-htsat-unfused")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = "cpu"
 clap_model.to(device)
 CLAP_SAMPLING_RATE = 48000
 print(f"Model and processor loaded successfully. Using device: {device}")
@@ -55,118 +44,78 @@ label_categories = {
     "Emotional Tone": class_labels_emotion,
 }
 
-def run_clap_inference(audio_segment, class_labels, model, processor, device, target_sampling_rate):
-    """Run CLAP inference on an audio segment for a specific set of labels."""
-    inputs = processor(
-        text=class_labels,
-        audios=[audio_segment],
-        return_tensors="pt",
-        padding=True,
-        sampling_rate=target_sampling_rate,
-    ).to(device)
+# --- Pre-compute Text Embeddings ---
+print("Pre-computing text embeddings for all labels...")
+text_embeddings_per_category = {}
+with torch.no_grad():
+    for category, labels in label_categories.items():
+        inputs = clap_processor(text=labels, return_tensors="pt", padding=True).to(device)
+        text_embeddings = clap_model.get_text_features(**inputs)
+        text_embeddings_per_category[category] = text_embeddings
+print("Text embeddings pre-computed.")
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-        logits_per_audio = outputs.logits_per_audio
 
-    probs = logits_per_audio.softmax(dim=-1).cpu().numpy()[0]
-    results = {label: prob for label, prob in zip(class_labels, probs)}
-    return results
+def process_recording(audio_path):
+    """
+    Processes a single audio recording file by comparing its embedding against
+    pre-computed text embeddings.
+    """
+    if audio_path is None:
+        empty_results = [{label: 0.0 for label in labels} for labels in label_categories.values()]
+        return empty_results
 
-def get_empty_clap_results():
-    return {cat: {label: 0.0 for label in labels} for cat, labels in label_categories.items()}
+    try:
+        waveform, sample_rate = torchaudio.load(audio_path)
+        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=CLAP_SAMPLING_RATE)
+        resampled_waveform = resampler(waveform).mean(dim=0)
 
-def process_streaming(state, new_chunk):
-    sample_rate, data = new_chunk
-    
-    if state is None:
-        vad_iterator = VADIterator(
-            vad_model, 
-            min_silence_duration_ms=1000, 
-            speech_pad_ms=300
-        )
-        state = {
-            "vad_iterator": vad_iterator,
-            "timestamps": [],
-            "resampler_vad": None,
-            "resampler_clap": torchaudio.transforms.Resample(orig_freq=VAD_SAMPLING_RATE, new_freq=CLAP_SAMPLING_RATE),
-            "audio_buffer": torch.tensor([]),
-            "speech_segment": torch.tensor([]),
-            "is_speaking": False,
-            "clap_results": get_empty_clap_results(),
-            "last_processed_segment": None
-        }
-    
-    audio_chunk = torch.from_numpy(data.astype(np.float32) / 32768.0)
-    
-    if sample_rate != VAD_SAMPLING_RATE:
-        if state["resampler_vad"] is None:
-            state["resampler_vad"] = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=VAD_SAMPLING_RATE)
-        audio_chunk = state["resampler_vad"](audio_chunk)
+        print(f"\n--- Processing recording: {audio_path} ---")
+        print(f"Waveform duration: {resampled_waveform.shape[0] / CLAP_SAMPLING_RATE:.2f} seconds")
 
-    state["audio_buffer"] = torch.cat([state["audio_buffer"], audio_chunk])
+        # 1. Get audio embeddings
+        audio_inputs = clap_processor(audios=[resampled_waveform.numpy()], return_tensors="pt", sampling_rate=CLAP_SAMPLING_RATE).to(device)
+        with torch.no_grad():
+            audio_embeddings = clap_model.get_audio_features(**audio_inputs)
 
-    clap_outputs = list(state["clap_results"].values())
-    processed_segment_for_debug = state["last_processed_segment"]
-
-    while state["audio_buffer"].shape[0] >= CHUNK_SIZE:
-        chunk_to_process = state["audio_buffer"][:CHUNK_SIZE]
-        state["audio_buffer"] = state["audio_buffer"][CHUNK_SIZE:]
-        
-        speech_dict = state["vad_iterator"](chunk_to_process, return_seconds=True)
-        if speech_dict:
-            if 'start' in speech_dict:
-                state["is_speaking"] = True
-                state["timestamps"].append(speech_dict)
+        final_results = []
+        # 2. Compare with pre-computed text embeddings for each category
+        for category, labels in label_categories.items():
+            text_embeddings = text_embeddings_per_category[category]
             
-            if state["is_speaking"]:
-                state["speech_segment"] = torch.cat([state["speech_segment"], chunk_to_process])
+            # 3. Calculate similarity and probabilities
+            with torch.no_grad():
+                # Note: We use the model's learned logit scale for accurate similarity
+                logits = torch.matmul(audio_embeddings, text_embeddings.T) * clap_model.logit_scale_a.exp()
+                probs = logits.softmax(dim=-1).cpu().numpy()[0]
 
-            if 'end' in speech_dict:
-                state["is_speaking"] = False
-                state["timestamps"].append(speech_dict)
-                
-                if state["speech_segment"].shape[0] > 0:
-                    processed_segment_for_debug = (VAD_SAMPLING_RATE, state["speech_segment"].numpy())
-                    state["last_processed_segment"] = processed_segment_for_debug
+            cat_results = {label: prob for label, prob in zip(labels, probs)}
+            final_results.append(cat_results)
+            
+            print(f"\n--- Category: {category} ---")
+            sorted_results = sorted(cat_results.items(), key=lambda item: item[1], reverse=True)
+            pprint(sorted_results)
 
-                    resampled_segment = state["resampler_clap"](state["speech_segment"])
-                    
-                    print("\n--- DEBUG: CLAP Inference Results ---")
-                    for category, labels in label_categories.items():
-                        results = run_clap_inference(
-                            resampled_segment.numpy(), labels, clap_model, clap_processor, device, CLAP_SAMPLING_RATE
-                        )
-                        state["clap_results"][category] = results
-                        print(f"\n--- Category: {category} ---")
-                        sorted_results = sorted(results.items(), key=lambda item: item[1], reverse=True)
-                        for label, prob in sorted_results:
-                            print(f"{label}: {prob:.2%}")
-                    print("--- END DEBUG ---\n")
-                    
-                    clap_outputs = list(state["clap_results"].values())
-                
-                state["speech_segment"] = torch.tensor([])
-    
-    return [state, pformat(state["timestamps"])] + clap_outputs + [processed_segment_for_debug]
+        print("--- END OF PROCESSING ---")
+        return final_results
+
+    except Exception as e:
+        print(f"Error processing audio file: {e}")
+        empty_results = [{label: 0.0 for label in labels} for labels in label_categories.values()]
+        return empty_results
+
 
 # --- Gradio Interface ---
 with gr.Blocks() as iface:
     gr.Markdown(
         """
-        # Live VAD + CLAP Classification (DEBUG MODE)
-        Speak into your microphone. The system will detect speech (VAD) and classify the audio content (CLAP) across different categories.
-        Check the console for detailed CLAP output.
+        # Manual Audio Classification with CLAP
+        Record audio using the microphone or upload a file. The classification will run automatically when you stop recording or upload a file.
+        The results from the CLAP model will be displayed below for different categories.
         """
     )
     
-    state = gr.State()
-    
     with gr.Row():
-        audio_input = gr.Audio(sources=["microphone"], streaming=True, label="Speak Here")
-        with gr.Column():
-            vad_output = gr.Textbox(label="VAD Timestamps")
-            debug_audio_output = gr.Audio(label="Listen to Last Processed Segment")
+        audio_input = gr.Audio(sources=["microphone", "upload"], type="filepath", label="Record or Upload Audio")
 
     with gr.Row():
         clap_output_human = gr.Label(label="Human Sounds", num_top_classes=3)
@@ -177,14 +126,14 @@ with gr.Blocks() as iface:
         clap_output_emotion = gr.Label(label="Emotional Tone", num_top_classes=3)
 
     outputs_list = [
-        state, vad_output, clap_output_human, clap_output_background, 
-        clap_output_technical, clap_output_emotion, debug_audio_output
+        clap_output_human, clap_output_background, 
+        clap_output_technical, clap_output_emotion
     ]
     
-    audio_input.stream(
-        fn=process_streaming,
-        inputs=[state, audio_input],
+    audio_input.change(
+        fn=process_recording,
+        inputs=audio_input,
         outputs=outputs_list
     )
 
-iface.launch()
+iface.launch(debug=True)

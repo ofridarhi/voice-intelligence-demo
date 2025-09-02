@@ -22,7 +22,7 @@ CHUNK_SIZE = 512
 print("Loading the CLAP model and processor...")
 clap_model = ClapModel.from_pretrained("laion/clap-htsat-unfused")
 clap_processor = ClapProcessor.from_pretrained("laion/clap-htsat-unfused")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = "cpu"
 clap_model.to(device)
 CLAP_SAMPLING_RATE = 48000
 print(f"Model and processor loaded successfully. Using device: {device}")
